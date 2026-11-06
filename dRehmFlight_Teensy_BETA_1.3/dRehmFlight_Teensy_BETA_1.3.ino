@@ -167,7 +167,8 @@ unsigned long channel_2_fs = 1000; //steer / pitch
 unsigned long channel_3_fs = 1000; //drive / flight throttle
 unsigned long channel_4_fs = 1000; //rudd
 unsigned long channel_5_fs = 1000; //arm switch: >1500 arms, <1500 cuts throttle
-unsigned long channel_6_fs = 1500; //mode switch: stays in the last mode, by design
+unsigned long channel_6_fs = 1000; //mode failsafe/default: wheel-drive mode
+unsigned long channel_7_fs = 1500; //ground-service actuator jog: low=retract, centre=idle, high=extend
 
 //Lift servo positions per mode, in PWMServo degrees (0-180).
 //VERIFY ON THE REAL MECHANISM BEFORE FLYING: mode 2 (Landed) and mode 3 (Flying) are both
@@ -184,14 +185,18 @@ unsigned long mode_2_servo_2 = 2;   //M2 Landed   - mechanism extended
 unsigned long mode_3_servo_1 = 2;   //M3 Flying   - mechanism extended
 unsigned long mode_3_servo_2 = 2;   //M3 Flying   - mechanism extended
 
-//Linear actuator timing. The datasheet figure for the fitted units is 15 mm/s over 100 mm,
-//i.e. ~6.7 s for a full stroke. The mechanism is not instrumented, so this is an open-loop
-//time budget: flight motors stay muted until the stroke time has elapsed with margin.
-float actuatorStrokeTime = 8.0;     //seconds, full stroke + margin. MEASURE YOUR OWN UNITS.
-float landHoldTime = 1.0;           //seconds the stick must stay down before the arms retract
-unsigned long actuatorOverrunTime = 1000; //ms of extra actuator drive after the stroke, then power off
+//Linear actuator timing. The fitted units are rated at 15 mm/s over 100 mm, but the mechanism
+//is not instrumented. These are two independent open-loop timers, both starting on deploy:
+//1. actuatorDriveTime: drive the two H-bridge direction outputs, then switch them off.
+//2. flightMotorEnableDelay: absolute earliest time flight motors may receive authority.
+//The motor delay must never be shorter than actuatorDriveTime; the state machine also enforces
+//"actuator output stopped" independently, so changing one value cannot bypass the other.
+float actuatorDriveTime = 6.2;        //seconds. TUNE UNDER LOAD; 15 mm/s -> ~6.4 s for 95 mm.
+float flightMotorEnableDelay = 10.0;  //seconds from deploy start before flight motors may arm.
+float manualJogPulseTime = 0.2;       //seconds per CH7 edge pulse. One pulse per centre->end move.
+float landHoldTime = 1.0;             //seconds the stick must stay down before the arms retract
 
-int mode=0;  //Mode 1 = Driving    Mode 2 = Landed     Mode 3 = Flying
+int mode=1;  //Mode 1 = Driving    Mode 2 = Landed     Mode 3 = Flying
 
 //Filter parameters - Defaults tuned for 2kHz loop rate; Do not touch unless you know what you are doing:
 float B_madgwick = 0.04;  //Madgwick filter parameter
@@ -307,8 +312,8 @@ unsigned long blink_counter, blink_delay;
 bool blinkAlternate;
 
 //Radio communication:
-unsigned long channel_1_pwm, channel_2_pwm, channel_3_pwm, channel_4_pwm, channel_5_pwm, channel_6_pwm;
-unsigned long channel_1_pwm_prev, channel_2_pwm_prev, channel_3_pwm_prev, channel_4_pwm_prev, channel_5_pwm_prev, channel_6_pwm_prev;
+unsigned long channel_1_pwm, channel_2_pwm, channel_3_pwm, channel_4_pwm, channel_5_pwm, channel_6_pwm, channel_7_pwm;
+unsigned long channel_1_pwm_prev, channel_2_pwm_prev, channel_3_pwm_prev, channel_4_pwm_prev, channel_5_pwm_prev, channel_6_pwm_prev, channel_7_pwm_prev;
 
 #if defined USE_SBUS_RX
   SBUS sbus(Serial5);
@@ -360,8 +365,10 @@ bool armedFly = false;
 //(Correction 2026-09-27: an earlier note here claimed modeControl() overwrote m1-m4 with
 //thro_des in flight mode. That is not true of the original file - its mode 3 branch does not
 //touch m1-m4 at all. The real defect was the missing stroke interlock, not a dead PID path.)
-//MECH_STARTUP / MECH_RETRACTING / MECH_LAND_LOCK : flight motors muted
-//MECH_DEPLOYING / MECH_FLIGHT_READY            : flight motors allowed (armed + CH5 on)
+//MECH_STARTUP / MECH_DEPLOYING / MECH_RETRACTING : flight motors muted and mechanism moving
+//MECH_FLIGHT_READY: actuator output stopped, then flight motors allowed only after the
+//independent motor-enable delay has elapsed (still requiring armed + CH5 on)
+//MECH_LAND_LOCK: flight motors muted; wheels may be armed only in driving mode
 //m1-m6 are owned by controlMixer() alone; this function never writes a motor variable.
 //Actuator pins: servo3Pin/servo4Pin = actuator 1, servo5Pin/servo6Pin = actuator 2.
 //Two pins per actuator form an H-bridge style direction pair (one HIGH, one LOW, both LOW = off).
@@ -369,12 +376,20 @@ bool armedFly = false;
 //Teensy pin and the actuator motor.
 enum MechState { MECH_STARTUP, MECH_RETRACTING, MECH_LAND_LOCK, MECH_DEPLOYING, MECH_FLIGHT_READY };
 MechState mechState = MECH_STARTUP;
+enum ManualJogDirection { MANUAL_JOG_IDLE, MANUAL_JOG_RETRACT, MANUAL_JOG_EXTEND };
+ManualJogDirection manualJogActive = MANUAL_JOG_IDLE;
+ManualJogDirection manualJogSwitchPrevious = MANUAL_JOG_IDLE;
 bool mechDeployed = false;          //true = arms out, only then may the flight motors spin
 bool flightMotorsAllowed = false;   //gates ALL m1-m4 output: PID authority cannot bypass this
 unsigned long mechTimerStart = 0;
 unsigned long armedTimerStart = 0;
 unsigned long stickDownStart = 0;
-long mechTimerMax = 0;
+unsigned long flightMotorEnableStartMs = 0;
+unsigned long manualJogStartMs = 0;
+unsigned long activeActuatorDriveMs = 0;
+bool radioFailsafeActive = true;
+bool wheelModeSelectedAtBoot = false;
+bool retractionStartedFromReady = false;
 
 //========================================================================================================================//
 //                                                      VOID SETUP                                                        //                           
@@ -429,7 +444,9 @@ void setup() {
   channel_3_pwm = channel_3_fs;
   channel_4_pwm = channel_4_fs;
   channel_5_pwm = channel_5_fs;
-  channel_6_pwm = channel_6_fs;
+  channel_6_pwm = 1500;  //unknown until a valid receiver frame selects a mode
+  channel_7_pwm = channel_7_fs;
+  channel_7_pwm_prev = channel_7_fs;
 
   //Initialize IMU communication
   IMUinit();
@@ -541,13 +558,86 @@ void loop() {
 //                                                      FUNCTIONS                                                         //                           
 //========================================================================================================================//
 
+unsigned long secondsToMilliseconds(float seconds){
+  if (seconds <= 0.0f) return 0;
+  return (unsigned long)(seconds * 1000.0f + 0.5f);
+}
+
+ManualJogDirection manualJogSwitchPosition(){
+  if (channel_7_pwm < 1250) return MANUAL_JOG_RETRACT;
+  if (channel_7_pwm > 1750) return MANUAL_JOG_EXTEND;
+  return MANUAL_JOG_IDLE;
+}
+
+bool manualJogInterlocksClosed(){
+  const bool stableMechState = (mechState == MECH_FLIGHT_READY) || (mechState == MECH_LAND_LOCK);
+  return !radioFailsafeActive
+      && stableMechState
+      && (channel_5_pwm < 1400)       // make the off position unambiguous
+      && (channel_3_pwm < 1050)       // throttle must be at its minimum
+      && !armedFly
+      && !flightMotorsAllowed;
+}
+
+void driveManualJog(ManualJogDirection direction){
+  if (direction == MANUAL_JOG_EXTEND) {
+    setActuatorsExtended();
+  } else if (direction == MANUAL_JOG_RETRACT) {
+    setActuatorsRetracted();
+  } else {
+    stopActuators();
+  }
+}
+
+void updateManualJog(){
+  const ManualJogDirection requested = manualJogSwitchPosition();
+  const bool interlockClosed = manualJogInterlocksClosed();
+  const unsigned long pulseTimeMs = secondsToMilliseconds(manualJogPulseTime);
+
+  if (manualJogActive != MANUAL_JOG_IDLE) {
+    const bool pulseFinished = (unsigned long)(millis() - manualJogStartMs) >= pulseTimeMs;
+    if (!interlockClosed || pulseFinished) {
+      stopActuators();
+      manualJogActive = MANUAL_JOG_IDLE;
+      manualJogStartMs = 0;
+    } else {
+      driveManualJog(manualJogActive);
+    }
+  }
+
+  // Only a centre -> end transition starts a pulse. Holding the switch at an end cannot
+  // repeat it, and jumping directly from one end to the other cannot start the reverse pulse.
+  if (manualJogActive == MANUAL_JOG_IDLE
+      && interlockClosed
+      && (requested != MANUAL_JOG_IDLE)
+      && (manualJogSwitchPrevious == MANUAL_JOG_IDLE)) {
+    manualJogActive = requested;
+    manualJogStartMs = millis();
+    flightMotorsAllowed = false;
+    flightMotorEnableStartMs = millis();  // any manual adjustment restarts the motor-delay timer
+    if (requested == MANUAL_JOG_RETRACT) {
+      mechDeployed = false;               // a retract jog invalidates the ready declaration
+    }
+    driveManualJog(manualJogActive);
+  }
+
+  manualJogSwitchPrevious = requested;
+}
+
 void updateMechanism(){
   //FIX 2026-09-11: replaces the original modeControl().
   //Only the mechanism and the lift servos are commanded here. Every motor variable (m1-m6)
   //belongs to controlMixer(); this function only publishes the mechState that the mixer and
   //throttleCut() use as their permission gates.
   //Retraction is refused in flight: airspeed would fold the arms. Land first.
-  if (channel_6_pwm < 1100){
+  //Power-up is always wheel mode. The pilot must show an unambiguous CH6 wheel
+  //position on a valid receiver frame before landed/flight modes are accepted.
+  if (!radioFailsafeActive && (channel_6_pwm < 1100)) {
+    wheelModeSelectedAtBoot = true;
+  }
+  if (!wheelModeSelectedAtBoot) {
+    mode = 1;
+  } else if (channel_6_pwm < 1100){
     mode = 1;                                        //Driving
   } else if ((channel_6_pwm > 1400) && (channel_6_pwm < 1600)){
     mode = 2;                                        //Landed
@@ -556,36 +646,43 @@ void updateMechanism(){
   }
   //Between 1100-1400 and 1600-1900 the previous mode is deliberately held.
 
-  if (mode == 0) mode = 2;                           //startup: deploy the mechanism first
-  if (mechTimerMax == 0) mechTimerMax = (long)(actuatorStrokeTime * 1000.0);
+  updateManualJog();
+
+  const unsigned long fullActuatorDriveTimeMs = secondsToMilliseconds(actuatorDriveTime);
+  const unsigned long actuatorDriveTimeMs = activeActuatorDriveMs;
+  const unsigned long flightMotorEnableDelayMs = secondsToMilliseconds(flightMotorEnableDelay);
   unsigned long elapsed = millis() - mechTimerStart;
 
   switch (mechState) {
     case MECH_STARTUP:
-      //Never retract on the bench: go straight to the extended position.
-      deploySequence();
+      //Default to the wheel configuration at every power-up.
+      retractSequence();
       break;
 
     case MECH_DEPLOYING:
       s1_command_PWM = mode_3_servo_1;
       s2_command_PWM = mode_3_servo_2;
       setActuatorsExtended();
-      if (elapsed >= (unsigned long)mechTimerMax) {
-        mechTimerStart = millis();
+      if (elapsed >= actuatorDriveTimeMs) {
         mechState = MECH_FLIGHT_READY;
-        mechDeployed = true;
-        flightMotorsAllowed = true;                 //stroke finished: PID may drive m1-m4 now
+        mechDeployed = true;                        //timed deployment complete, not sensor-confirmed position
+        flightMotorsAllowed = false;
+        stopActuators();                            //output is off before flight authority can exist
       }
       break;
 
     case MECH_FLIGHT_READY:
       s1_command_PWM = mode_3_servo_1;
       s2_command_PWM = mode_3_servo_2;
-      if (elapsed >= actuatorOverrunTime) {
-        stopActuators();                             //stroke is done: do not hold the driver on
-      } else {
+      if (elapsed < actuatorDriveTimeMs) {
         setActuatorsExtended();
+      } else if (manualJogActive == MANUAL_JOG_IDLE) {
+        stopActuators();                            //no overrun: stop on the same control cycle
       }
+      flightMotorsAllowed = mechDeployed
+                         && (elapsed >= actuatorDriveTimeMs)
+                         && ((unsigned long)(millis() - flightMotorEnableStartMs) >= flightMotorEnableDelayMs)
+                         && (manualJogActive == MANUAL_JOG_IDLE);
       if (mode == 1) {
         if (thro_des < 0.05) {
           if (stickDownStart == 0) stickDownStart = millis();
@@ -601,26 +698,30 @@ void updateMechanism(){
     case MECH_RETRACTING:
       //Reverse on the TARGET mode, not on the state: mechState is MECH_RETRACTING for this
       //whole branch, so only mode can tell us the pilot asked to fly again mid-transition.
-      if (mode == 3) {
-        deploySequence();
+      if ((mode == 3) && retractionStartedFromReady) {
+        const unsigned long retractedTimeMs = (elapsed < fullActuatorDriveTimeMs)
+                                            ? elapsed
+                                            : fullActuatorDriveTimeMs;
+        reverseToFlightSequence(retractedTimeMs);
         break;
       }
       s1_command_PWM = mode_1_servo_1;
       s2_command_PWM = mode_1_servo_2;
       setActuatorsRetracted();
-      if (elapsed >= (unsigned long)mechTimerMax) {
-        mechTimerStart = millis();
+      if (elapsed >= actuatorDriveTimeMs) {
         mechState = MECH_LAND_LOCK;
+        flightMotorsAllowed = false;
+        retractionStartedFromReady = false;
+        stopActuators();
       }
       break;
 
     case MECH_LAND_LOCK:
       s1_command_PWM = mode_1_servo_1;
       s2_command_PWM = mode_1_servo_2;
-      if (elapsed >= actuatorOverrunTime) {
+      flightMotorsAllowed = false;
+      if (manualJogActive == MANUAL_JOG_IDLE) {
         stopActuators();
-      } else {
-        setActuatorsRetracted();
       }
       if (mode == 3) deploySequence();               //flying was requested, extend again
       break;
@@ -643,16 +744,36 @@ void deploySequence(){
   mechState = MECH_DEPLOYING;
   mechDeployed = false;
   flightMotorsAllowed = false;
+  manualJogActive = MANUAL_JOG_IDLE;
+  retractionStartedFromReady = false;
+  activeActuatorDriveMs = secondsToMilliseconds(actuatorDriveTime);
   mechTimerStart = millis();
+  flightMotorEnableStartMs = millis();
   stickDownStart = 0;
 }
 
 void retractSequence(){
+  retractionStartedFromReady = mechDeployed;
   mechState = MECH_RETRACTING;
   mechDeployed = false;
   flightMotorsAllowed = false;                      //cut motor authority through the whole fold
+  manualJogActive = MANUAL_JOG_IDLE;
   armedFly = false;                                 //retraction also disarms
+  activeActuatorDriveMs = secondsToMilliseconds(actuatorDriveTime);
   mechTimerStart = millis();
+  stickDownStart = 0;
+}
+
+void reverseToFlightSequence(unsigned long retractedTimeMs){
+  const unsigned long fullDriveTimeMs = secondsToMilliseconds(actuatorDriveTime);
+  mechState = MECH_DEPLOYING;
+  mechDeployed = false;
+  flightMotorsAllowed = false;
+  manualJogActive = MANUAL_JOG_IDLE;
+  retractionStartedFromReady = false;
+  activeActuatorDriveMs = (retractedTimeMs < fullDriveTimeMs) ? retractedTimeMs : fullDriveTimeMs;
+  mechTimerStart = millis();
+  flightMotorEnableStartMs = millis();
   stickDownStart = 0;
 }
 
@@ -1441,6 +1562,7 @@ void getCommands() {
     channel_4_pwm = getRadioPWM(4);
     channel_5_pwm = getRadioPWM(5);
     channel_6_pwm = getRadioPWM(6);
+    channel_7_pwm = getRadioPWM(7);
     
   #elif defined USE_SBUS_RX
     if (sbus.read(&sbusChannels[0], &sbusFailSafe, &sbusLostFrame))
@@ -1455,7 +1577,8 @@ void getCommands() {
       channel_3_pwm = sbusChannels[2] * scale + bias;
       channel_4_pwm = sbusChannels[3] * scale + bias;
       channel_5_pwm = sbusChannels[4] * scale + bias;
-      channel_6_pwm = sbusChannels[5] * scale + bias; 
+      channel_6_pwm = sbusChannels[5] * scale + bias;
+      channel_7_pwm = sbusChannels[6] * scale + bias;
     }
     if ((millis() - sbusLastFrameMs) > 100) {
       sbusLinkLost = true;
@@ -1475,6 +1598,7 @@ void getCommands() {
         channel_4_pwm = values[3];
         channel_5_pwm = values[4];
         channel_6_pwm = values[5];
+        channel_7_pwm = values[6];
     }
   #endif
   
@@ -1490,8 +1614,10 @@ void getCommands() {
   channel_4_pwm_prev = channel_4_pwm;
   channel_5_pwm = (1.0 - b)*channel_5_pwm_prev + b*channel_5_pwm;
   channel_6_pwm = (1.0 - b)*channel_6_pwm_prev + b*channel_6_pwm;
+  channel_7_pwm = (1.0 - b)*channel_7_pwm_prev + b*channel_7_pwm;
   channel_5_pwm_prev = channel_5_pwm;
   channel_6_pwm_prev = channel_6_pwm;
+  channel_7_pwm_prev = channel_7_pwm;
 }
 
 void failSafe() {
@@ -1511,6 +1637,7 @@ void failSafe() {
   int check4 = 0;
   int check5 = 0;
   int check6 = 0;
+  int check7 = 0;
 #if defined USE_SBUS_RX
   bool linkLost = sbusLinkLost;
 #else
@@ -1524,15 +1651,18 @@ void failSafe() {
   if (channel_4_pwm > maxVal || channel_4_pwm < minVal) check4 = 1;
   if (channel_5_pwm > maxVal || channel_5_pwm < minVal) check5 = 1;
   if (channel_6_pwm > maxVal || channel_6_pwm < minVal) check6 = 1;
+  if (channel_7_pwm > maxVal || channel_7_pwm < minVal) check7 = 1;
 
   // If any failures, set to default failsafe values.
-  if (linkLost || (check1 + check2 + check3 + check4 + check5 + check6) > 0) {
+  radioFailsafeActive = linkLost || (check1 + check2 + check3 + check4 + check5 + check6 + check7) > 0;
+  if (radioFailsafeActive) {
     channel_1_pwm = channel_1_fs;
     channel_2_pwm = channel_2_fs;
     channel_3_pwm = channel_3_fs;
     channel_4_pwm = channel_4_fs;
     channel_5_pwm = channel_5_fs;
     channel_6_pwm = channel_6_fs;
+    channel_7_pwm = channel_7_fs;
     armedFly = false;
   }
 }
@@ -1858,7 +1988,9 @@ void printRadioData() {
     Serial.print(F(" CH5:"));
     Serial.print(channel_5_pwm);
     Serial.print(F(" CH6:"));
-    Serial.println(channel_6_pwm);
+    Serial.print(channel_6_pwm);
+    Serial.print(F(" CH7:"));
+    Serial.println(channel_7_pwm);
   }
 }
 
