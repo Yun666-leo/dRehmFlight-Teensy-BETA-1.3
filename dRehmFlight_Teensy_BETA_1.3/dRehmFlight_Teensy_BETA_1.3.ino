@@ -398,8 +398,8 @@ void setup() {
   esc4.attach(m4Pin, escMinPWM, escMaxPWM);
   esc5.attach(m5Pin, escMinPWM, escMaxPWM);
   esc6.attach(m6Pin, escMinPWM, escMaxPWM);
-  servo1.attach(servo1Pin, 760, 2400); //Pin, min PWM value, max PWM value
-  servo2.attach(servo2Pin, 900, 2030);
+  servo1.attach(servo1Pin, 900, 2450); //Pin, min PWM value, max PWM value
+  servo2.attach(servo2Pin, 830, 2500);
   //The four actuator direction pins are plain digital outputs, not servos:
   pinMode(servo3Pin, OUTPUT);
   pinMode(servo4Pin, OUTPUT);
