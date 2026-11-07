@@ -16,7 +16,7 @@
 
 本项目基于原作者发布的 dRehmFlight Teensy BETA 1.3：
 
-- 上游仓库：[填写原始仓库链接]
+- 上游仓库: https://github.com/MichaelRechtin/Transforming-Quadcopter
 - 上游许可证：CC0 1.0 Universal
 - 本仓库许可证：CC0 1.0 Universal
 
