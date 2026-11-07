@@ -191,9 +191,11 @@ unsigned long mode_3_servo_2 = 2;   //M3 Flying   - mechanism extended
 //2. flightMotorEnableDelay: absolute earliest time flight motors may receive authority.
 //The motor delay must never be shorter than actuatorDriveTime; the state machine also enforces
 //"actuator output stopped" independently, so changing one value cannot bypass the other.
-float actuatorDriveTime = 6.2;        //seconds. TUNE UNDER LOAD; 15 mm/s -> ~6.4 s for 95 mm.
+float actuatorDriveTime = 6.55;       //seconds. Current tuned value; verify loaded travel on hardware.
+float actuatorRetractTime = 8.0;      //seconds. Drive fully into the retracted endpoint before redeploying.
 float flightMotorEnableDelay = 10.0;  //seconds from deploy start before flight motors may arm.
 float manualJogPulseTime = 0.2;       //seconds per CH7 edge pulse. One pulse per centre->end move.
+float wheelModeConfirmTime = 0.5;     //seconds CH6 must remain low on a valid link before mode changes unlock.
 float landHoldTime = 1.0;             //seconds the stick must stay down before the arms retract
 
 int mode=1;  //Mode 1 = Driving    Mode 2 = Landed     Mode 3 = Flying
@@ -390,6 +392,7 @@ unsigned long activeActuatorDriveMs = 0;
 bool radioFailsafeActive = true;
 bool wheelModeSelectedAtBoot = false;
 bool retractionStartedFromReady = false;
+unsigned long wheelModeLowStartMs = 0;
 
 //========================================================================================================================//
 //                                                      VOID SETUP                                                        //                           
@@ -446,6 +449,12 @@ void setup() {
   channel_5_pwm = channel_5_fs;
   channel_6_pwm = 1500;  //unknown until a valid receiver frame selects a mode
   channel_7_pwm = channel_7_fs;
+  channel_1_pwm_prev = channel_1_fs;
+  channel_2_pwm_prev = channel_2_fs;
+  channel_3_pwm_prev = channel_3_fs;
+  channel_4_pwm_prev = channel_4_fs;
+  channel_5_pwm_prev = channel_5_fs;
+  channel_6_pwm_prev = 1500;
   channel_7_pwm_prev = channel_7_fs;
 
   //Initialize IMU communication
@@ -596,7 +605,8 @@ void updateManualJog(){
 
   if (manualJogActive != MANUAL_JOG_IDLE) {
     const bool pulseFinished = (unsigned long)(millis() - manualJogStartMs) >= pulseTimeMs;
-    if (!interlockClosed || pulseFinished) {
+    const bool switchCentredOrReversed = requested != manualJogActive;
+    if (!interlockClosed || switchCentredOrReversed || pulseFinished) {
       stopActuators();
       manualJogActive = MANUAL_JOG_IDLE;
       manualJogStartMs = 0;
@@ -633,7 +643,12 @@ void updateMechanism(){
   //Power-up is always wheel mode. The pilot must show an unambiguous CH6 wheel
   //position on a valid receiver frame before landed/flight modes are accepted.
   if (!radioFailsafeActive && (channel_6_pwm < 1100)) {
-    wheelModeSelectedAtBoot = true;
+    if (wheelModeLowStartMs == 0) wheelModeLowStartMs = millis();
+    if ((unsigned long)(millis() - wheelModeLowStartMs) >= secondsToMilliseconds(wheelModeConfirmTime)) {
+      wheelModeSelectedAtBoot = true;
+    }
+  } else {
+    wheelModeLowStartMs = 0;
   }
   if (!wheelModeSelectedAtBoot) {
     mode = 1;
@@ -759,7 +774,7 @@ void retractSequence(){
   flightMotorsAllowed = false;                      //cut motor authority through the whole fold
   manualJogActive = MANUAL_JOG_IDLE;
   armedFly = false;                                 //retraction also disarms
-  activeActuatorDriveMs = secondsToMilliseconds(actuatorDriveTime);
+  activeActuatorDriveMs = secondsToMilliseconds(actuatorRetractTime);
   mechTimerStart = millis();
   stickDownStart = 0;
 }
@@ -1614,7 +1629,7 @@ void getCommands() {
   channel_4_pwm_prev = channel_4_pwm;
   channel_5_pwm = (1.0 - b)*channel_5_pwm_prev + b*channel_5_pwm;
   channel_6_pwm = (1.0 - b)*channel_6_pwm_prev + b*channel_6_pwm;
-  channel_7_pwm = (1.0 - b)*channel_7_pwm_prev + b*channel_7_pwm;
+  //CH7 is a service control. Do not low-pass it: centring must stop the pulse immediately.
   channel_5_pwm_prev = channel_5_pwm;
   channel_6_pwm_prev = channel_6_pwm;
   channel_7_pwm_prev = channel_7_pwm;
